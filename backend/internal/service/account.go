@@ -412,12 +412,20 @@ func (a *Account) resolveModelMapping(rawMapping map[string]any) map[string]stri
 		if a.Platform == domain.PlatformAntigravity {
 			return domain.DefaultAntigravityModelMapping
 		}
+		// Bedrock 平台使用默认映射
+		if a.IsBedrock() {
+			return domain.DefaultBedrockModelMapping
+		}
 		return nil
 	}
 	if len(rawMapping) == 0 {
 		// Antigravity 平台使用默认映射
 		if a.Platform == domain.PlatformAntigravity {
 			return domain.DefaultAntigravityModelMapping
+		}
+		// Bedrock 平台使用默认映射
+		if a.IsBedrock() {
+			return domain.DefaultBedrockModelMapping
 		}
 		return nil
 	}
@@ -442,6 +450,10 @@ func (a *Account) resolveModelMapping(rawMapping map[string]any) map[string]stri
 	// Antigravity 平台使用默认映射
 	if a.Platform == domain.PlatformAntigravity {
 		return domain.DefaultAntigravityModelMapping
+	}
+	// Bedrock 平台使用默认映射
+	if a.IsBedrock() {
+		return domain.DefaultBedrockModelMapping
 	}
 	return nil
 }
@@ -762,6 +774,10 @@ func (a *Account) IsInterceptWarmupEnabled() bool {
 		}
 	}
 	return false
+}
+
+func (a *Account) IsBedrock() bool {
+	return a.Platform == PlatformAnthropic && a.Type == AccountTypeBedrock
 }
 
 func (a *Account) IsOpenAI() bool {

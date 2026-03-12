@@ -31,6 +31,7 @@ const (
 	AccountTypeSetupToken = "setup-token" // Setup Token类型账号（inference only scope）
 	AccountTypeAPIKey     = "apikey"      // API Key类型账号
 	AccountTypeUpstream   = "upstream"    // 上游透传类型账号（通过 Base URL + API Key 连接上游）
+	AccountTypeBedrock    = "bedrock"     // AWS Bedrock 类型账号（通过 SigV4 签名连接 Bedrock）
 )
 
 // Redeem type constants
@@ -112,4 +113,22 @@ var DefaultAntigravityModelMapping = map[string]string{
 	// 其他官方模型
 	"gpt-oss-120b-medium":    "gpt-oss-120b-medium",
 	"tab_flash_lite_preview": "tab_flash_lite_preview",
+}
+
+// DefaultBedrockModelMapping 是 AWS Bedrock 平台的默认模型映射
+// 将 Anthropic 标准模型名映射到 Bedrock 模型 ID
+var DefaultBedrockModelMapping = map[string]string{
+	// Claude Opus
+	"claude-opus-4-6-thinking":   "us.anthropic.claude-opus-4-6-thinking-20250514-v1:0",
+	"claude-opus-4-6":            "us.anthropic.claude-opus-4-6-thinking-20250514-v1:0",
+	"claude-opus-4-5-thinking":   "us.anthropic.claude-opus-4-6-thinking-20250514-v1:0",
+	"claude-opus-4-5-20251101":   "us.anthropic.claude-opus-4-6-thinking-20250514-v1:0",
+	// Claude Sonnet
+	"claude-sonnet-4-6":          "us.anthropic.claude-sonnet-4-6-20250514-v1:0",
+	"claude-sonnet-4-5":          "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+	"claude-sonnet-4-5-thinking": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+	"claude-sonnet-4-5-20250929": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+	// Claude Haiku
+	"claude-haiku-4-5":          "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+	"claude-haiku-4-5-20251001": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 }

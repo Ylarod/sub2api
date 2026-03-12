@@ -3493,6 +3493,8 @@ func (s *GatewayService) GetAccessToken(ctx context.Context, account *Account) (
 			return "", "", errors.New("api_key not found in credentials")
 		}
 		return apiKey, "apikey", nil
+	case AccountTypeBedrock:
+		return "", "bedrock", nil // Bedrock 使用 SigV4 签名，不需要 token
 	default:
 		return "", "", fmt.Errorf("unsupported account type: %s", account.Type)
 	}
@@ -3946,6 +3948,10 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			}
 		}
 		return s.forwardAnthropicAPIKeyPassthrough(ctx, c, account, passthroughBody, passthroughModel, parsed.Stream, startTime)
+	}
+
+	if account != nil && account.IsBedrock() {
+		return s.forwardBedrock(ctx, c, account, parsed, startTime)
 	}
 
 	// Beta policy: evaluate once; block check + cache filter set for buildUpstreamRequest.
@@ -5066,6 +5072,274 @@ func writeAnthropicPassthroughResponseHeaders(dst http.Header, src http.Header, 
 	if v := strings.TrimSpace(src.Get("x-request-id")); v != "" {
 		dst.Set("x-request-id", v)
 	}
+}
+
+// forwardBedrock 转发请求到 AWS Bedrock
+func (s *GatewayService) forwardBedrock(
+	ctx context.Context,
+	c *gin.Context,
+	account *Account,
+	parsed *ParsedRequest,
+	startTime time.Time,
+) (*ForwardResult, error) {
+	reqModel := parsed.Model
+	reqStream := parsed.Stream
+	body := parsed.Body
+
+	// 模型映射
+	mappedModel := account.GetMappedModel(reqModel)
+	if mappedModel != reqModel {
+		logger.LegacyPrintf("service.gateway", "[Bedrock] Model mapping: %s -> %s (account: %s)", reqModel, mappedModel, account.Name)
+	}
+
+	// 准备请求体（注入 anthropic_version，移除 model 字段）
+	bedrockBody, err := PrepareBedrockRequestBody(body)
+	if err != nil {
+		return nil, fmt.Errorf("prepare bedrock request body: %w", err)
+	}
+
+	proxyURL := ""
+	if account.ProxyID != nil && account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+
+	logger.LegacyPrintf("service.gateway", "[Bedrock] 命中 Bedrock 分支: account=%d name=%s model=%s->%s stream=%v",
+		account.ID, account.Name, reqModel, mappedModel, reqStream)
+
+	setOpsUpstreamRequestBody(c, bedrockBody)
+
+	// 创建签名器
+	signer, err := NewBedrockSignerFromAccount(account)
+	if err != nil {
+		return nil, fmt.Errorf("create bedrock signer: %w", err)
+	}
+	region := account.GetCredential("aws_region")
+
+	var resp *http.Response
+	retryStart := time.Now()
+	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
+		upstreamReq, err := s.buildUpstreamRequestBedrock(ctx, bedrockBody, mappedModel, region, reqStream, signer)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err = s.httpUpstream.DoWithTLS(upstreamReq, proxyURL, account.ID, account.Concurrency, false)
+		if err != nil {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			safeErr := sanitizeUpstreamErrorMessage(err.Error())
+			setOpsUpstreamError(c, 0, safeErr, "")
+			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+				Platform:           account.Platform,
+				AccountID:          account.ID,
+				AccountName:        account.Name,
+				UpstreamStatusCode: 0,
+				Kind:               "request_error",
+				Message:            safeErr,
+			})
+			c.JSON(http.StatusBadGateway, gin.H{
+				"type": "error",
+				"error": gin.H{
+					"type":    "upstream_error",
+					"message": "Upstream request failed",
+				},
+			})
+			return nil, fmt.Errorf("upstream request failed: %s", safeErr)
+		}
+
+		if resp.StatusCode >= 400 && resp.StatusCode != 400 && s.shouldRetryUpstreamError(account, resp.StatusCode) {
+			if attempt < maxRetryAttempts {
+				elapsed := time.Since(retryStart)
+				if elapsed >= maxRetryElapsed {
+					break
+				}
+
+				delay := retryBackoffDelay(attempt)
+				remaining := maxRetryElapsed - elapsed
+				if delay > remaining {
+					delay = remaining
+				}
+				if delay <= 0 {
+					break
+				}
+
+				respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+				_ = resp.Body.Close()
+				appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+					Platform:           account.Platform,
+					AccountID:          account.ID,
+					AccountName:        account.Name,
+					UpstreamStatusCode: resp.StatusCode,
+					Kind:               "retry",
+					Message:            extractUpstreamErrorMessage(respBody),
+					Detail: func() string {
+						if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {
+							return truncateString(string(respBody), s.cfg.Gateway.LogUpstreamErrorBodyMaxBytes)
+						}
+						return ""
+					}(),
+				})
+				logger.LegacyPrintf("service.gateway", "[Bedrock] account %d: upstream error %d, retry %d/%d after %v",
+					account.ID, resp.StatusCode, attempt, maxRetryAttempts, delay)
+				if err := sleepWithContext(ctx, delay); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			break
+		}
+
+		break
+	}
+	if resp == nil || resp.Body == nil {
+		return nil, errors.New("upstream request failed: empty response")
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// failover 处理
+	if resp.StatusCode >= 400 && s.shouldRetryUpstreamError(account, resp.StatusCode) {
+		if s.shouldFailoverUpstreamError(resp.StatusCode) {
+			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+			_ = resp.Body.Close()
+			resp.Body = io.NopCloser(bytes.NewReader(respBody))
+
+			logger.LegacyPrintf("service.gateway", "[Bedrock] Upstream error (retry exhausted, failover): Account=%d(%s) Status=%d Body=%s",
+				account.ID, account.Name, resp.StatusCode, truncateString(string(respBody), 1000))
+
+			s.handleRetryExhaustedSideEffects(ctx, resp, account)
+			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+				Platform:           account.Platform,
+				AccountID:          account.ID,
+				AccountName:        account.Name,
+				UpstreamStatusCode: resp.StatusCode,
+				Kind:               "retry_exhausted_failover",
+				Message:            extractUpstreamErrorMessage(respBody),
+			})
+			return nil, &UpstreamFailoverError{
+				StatusCode: resp.StatusCode,
+				ResponseBody: respBody,
+			}
+		}
+		return s.handleRetryExhaustedError(ctx, resp, c, account)
+	}
+
+	if resp.StatusCode >= 400 && s.shouldFailoverUpstreamError(resp.StatusCode) {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+
+		s.handleFailoverSideEffects(ctx, resp, account)
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: resp.StatusCode,
+			Kind:               "failover",
+			Message:            extractUpstreamErrorMessage(respBody),
+		})
+		return nil, &UpstreamFailoverError{
+			StatusCode:   resp.StatusCode,
+			ResponseBody: respBody,
+		}
+	}
+
+	if resp.StatusCode >= 400 {
+		return s.handleErrorResponse(ctx, resp, c, account)
+	}
+
+	// 响应处理
+	var usage *ClaudeUsage
+	var firstTokenMs *int
+	var clientDisconnect bool
+	if reqStream {
+		streamResult, err := s.handleBedrockStreamingResponse(ctx, resp, c, account, startTime, reqModel)
+		if err != nil {
+			return nil, err
+		}
+		usage = streamResult.usage
+		firstTokenMs = streamResult.firstTokenMs
+		clientDisconnect = streamResult.clientDisconnect
+	} else {
+		usage, err = s.handleBedrockNonStreamingResponse(ctx, resp, c, account)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if usage == nil {
+		usage = &ClaudeUsage{}
+	}
+
+	return &ForwardResult{
+		RequestID:        resp.Header.Get("x-amzn-requestid"),
+		Usage:            *usage,
+		Model:            reqModel,
+		Stream:           reqStream,
+		Duration:         time.Since(startTime),
+		FirstTokenMs:     firstTokenMs,
+		ClientDisconnect: clientDisconnect,
+	}, nil
+}
+
+// buildUpstreamRequestBedrock 构建 Bedrock 上游请求
+func (s *GatewayService) buildUpstreamRequestBedrock(
+	ctx context.Context,
+	body []byte,
+	modelID string,
+	region string,
+	stream bool,
+	signer *BedrockSigner,
+) (*http.Request, error) {
+	targetURL := BuildBedrockURL(region, modelID, stream)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	// SigV4 签名
+	if err := signer.SignRequest(ctx, req, body); err != nil {
+		return nil, fmt.Errorf("sign bedrock request: %w", err)
+	}
+
+	return req, nil
+}
+
+// handleBedrockNonStreamingResponse 处理 Bedrock 非流式响应
+// Bedrock InvokeModel 非流式响应的 body 格式与 Claude API 兼容
+func (s *GatewayService) handleBedrockNonStreamingResponse(
+	ctx context.Context,
+	resp *http.Response,
+	c *gin.Context,
+	account *Account,
+) (*ClaudeUsage, error) {
+	maxBytes := resolveUpstreamResponseReadLimit(s.cfg)
+	body, err := readUpstreamResponseBodyLimited(resp.Body, maxBytes)
+	if err != nil {
+		if errors.Is(err, ErrUpstreamResponseBodyTooLarge) {
+			setOpsUpstreamError(c, http.StatusBadGateway, "upstream response too large", "")
+			c.JSON(http.StatusBadGateway, gin.H{
+				"type": "error",
+				"error": gin.H{
+					"type":    "upstream_error",
+					"message": "Upstream response too large",
+				},
+			})
+		}
+		return nil, err
+	}
+
+	usage := parseClaudeUsageFromResponseBody(body)
+
+	c.Header("Content-Type", "application/json")
+	if v := resp.Header.Get("x-amzn-requestid"); v != "" {
+		c.Header("x-request-id", v)
+	}
+	c.Data(resp.StatusCode, "application/json", body)
+	return usage, nil
 }
 
 func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Context, account *Account, body []byte, token, tokenType, modelID string, reqStream bool, mimicClaudeCode bool) (*http.Request, error) {
@@ -7062,6 +7336,12 @@ func (s *GatewayService) ForwardCountTokens(ctx context.Context, c *gin.Context,
 			}
 		}
 		return s.forwardCountTokensAnthropicAPIKeyPassthrough(ctx, c, account, passthroughBody)
+	}
+
+	// Bedrock 不支持 count_tokens 端点
+	if account != nil && account.IsBedrock() {
+		s.countTokensError(c, http.StatusNotFound, "not_found_error", "count_tokens endpoint is not supported for Bedrock")
+		return nil
 	}
 
 	body := parsed.Body
