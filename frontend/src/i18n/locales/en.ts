@@ -2095,6 +2095,11 @@ export default {
       bedrockRegionRequired: 'Please select AWS Region',
       bedrockSessionTokenHint: 'Optional, for temporary credentials',
       bedrockSecretKeyLeaveEmpty: 'Leave empty to keep current key',
+      bedrockApiKeyLabel: 'Bedrock API Key',
+      bedrockApiKeyDesc: 'Bearer Token',
+      bedrockApiKeyInput: 'API Key',
+      bedrockApiKeyRequired: 'Please enter Bedrock API Key',
+      bedrockApiKeyLeaveEmpty: 'Leave empty to keep current key',
       apiKeyIsRequired: 'API Key is required',
       leaveEmptyToKeep: 'Leave empty to keep current key',
       // Upstream type

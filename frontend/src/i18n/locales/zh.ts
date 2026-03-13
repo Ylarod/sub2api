@@ -2236,6 +2236,11 @@ export default {
       bedrockRegionRequired: '请选择 AWS Region',
       bedrockSessionTokenHint: '可选，用于临时凭证',
       bedrockSecretKeyLeaveEmpty: '留空以保持当前密钥',
+      bedrockApiKeyLabel: 'Bedrock API Key',
+      bedrockApiKeyDesc: 'Bearer Token 认证',
+      bedrockApiKeyInput: 'API Key',
+      bedrockApiKeyRequired: '请输入 Bedrock API Key',
+      bedrockApiKeyLeaveEmpty: '留空以保持当前密钥',
       apiKeyIsRequired: 'API Key 是必需的',
       leaveEmptyToKeep: '留空以保持当前密钥',
       // Upstream type

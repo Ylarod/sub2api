@@ -777,7 +777,11 @@ func (a *Account) IsInterceptWarmupEnabled() bool {
 }
 
 func (a *Account) IsBedrock() bool {
-	return a.Platform == PlatformAnthropic && a.Type == AccountTypeBedrock
+	return a.Platform == PlatformAnthropic && (a.Type == AccountTypeBedrock || a.Type == AccountTypeBedrockAPIKey)
+}
+
+func (a *Account) IsBedrockAPIKey() bool {
+	return a.Platform == PlatformAnthropic && a.Type == AccountTypeBedrockAPIKey
 }
 
 func (a *Account) IsOpenAI() bool {

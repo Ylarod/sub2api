@@ -3495,6 +3495,8 @@ func (s *GatewayService) GetAccessToken(ctx context.Context, account *Account) (
 		return apiKey, "apikey", nil
 	case AccountTypeBedrock:
 		return "", "bedrock", nil // Bedrock 使用 SigV4 签名，不需要 token
+	case AccountTypeBedrockAPIKey:
+		return "", "bedrock-apikey", nil // Bedrock API Key 使用 Bearer Token，由 forwardBedrock 处理
 	default:
 		return "", "", fmt.Errorf("unsupported account type: %s", account.Type)
 	}
@@ -5108,17 +5110,35 @@ func (s *GatewayService) forwardBedrock(
 
 	setOpsUpstreamRequestBody(c, bedrockBody)
 
-	// 创建签名器
-	signer, err := NewBedrockSignerFromAccount(account)
-	if err != nil {
-		return nil, fmt.Errorf("create bedrock signer: %w", err)
-	}
 	region := account.GetCredential("aws_region")
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	// 根据账号类型选择认证方式
+	var signer *BedrockSigner
+	var bedrockAPIKey string
+	if account.IsBedrockAPIKey() {
+		bedrockAPIKey = account.GetCredential("api_key")
+		if bedrockAPIKey == "" {
+			return nil, fmt.Errorf("api_key not found in bedrock-apikey credentials")
+		}
+	} else {
+		signer, err = NewBedrockSignerFromAccount(account)
+		if err != nil {
+			return nil, fmt.Errorf("create bedrock signer: %w", err)
+		}
+	}
 
 	var resp *http.Response
 	retryStart := time.Now()
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
-		upstreamReq, err := s.buildUpstreamRequestBedrock(ctx, bedrockBody, mappedModel, region, reqStream, signer)
+		var upstreamReq *http.Request
+		if account.IsBedrockAPIKey() {
+			upstreamReq, err = s.buildUpstreamRequestBedrockAPIKey(ctx, bedrockBody, mappedModel, region, reqStream, bedrockAPIKey)
+		} else {
+			upstreamReq, err = s.buildUpstreamRequestBedrock(ctx, bedrockBody, mappedModel, region, reqStream, signer)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -5304,6 +5324,28 @@ func (s *GatewayService) buildUpstreamRequestBedrock(
 	if err := signer.SignRequest(ctx, req, body); err != nil {
 		return nil, fmt.Errorf("sign bedrock request: %w", err)
 	}
+
+	return req, nil
+}
+
+// buildUpstreamRequestBedrockAPIKey 构建 Bedrock API Key (Bearer Token) 上游请求
+func (s *GatewayService) buildUpstreamRequestBedrockAPIKey(
+	ctx context.Context,
+	body []byte,
+	modelID string,
+	region string,
+	stream bool,
+	apiKey string,
+) (*http.Request, error) {
+	targetURL := BuildBedrockURL(region, modelID, stream)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	return req, nil
 }
